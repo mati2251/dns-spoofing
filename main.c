@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
+#include <cstdint>
 #include <libnet.h>
 #include <linux/rtnetlink.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +32,9 @@ int if_index(char *if_name) {
   }
   close(sfd);
   return ifr.ifr_ifindex;
+}
+
+int iptables_dnat(char *interface) {
 }
 
 char *gateway_ip_addr(int if_index) {
@@ -171,6 +176,24 @@ void* arp_spoofing(void *args) {
   }
   libnet_destroy(ln);
   return 0;
+}
+
+uint32_t ip_addr(char *interface) {
+  int sfd = socket(PF_INET, SOCK_DGRAM, 0);
+  if (sfd < 0) {
+    perror("socket");
+    return -1;
+  }
+  struct ifreq ifr;
+  memset(&ifr, 0, sizeof(struct ifreq));
+  strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+  if (ioctl(sfd, SIOCGIFADDR, &ifr) < 0) {
+    perror("ioctl");
+    close(sfd);
+    return -1;
+  }
+  close(sfd);
+  return ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
 }
 
 int main(int argc, char **argv) {
