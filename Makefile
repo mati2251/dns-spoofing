@@ -20,11 +20,14 @@ nginx-stop:
 .PHONY: dnsmasq-run
 dnsmasq-run:
 	sudo dnsmasq -C spoof.conf
+	cp /etc/resolv.conf /etc/resolv.conf.bak
+	echo nameserver 127.0.0.1 > /etc/resolv.conf
 
 .PHONY: dnsmasq-stop
 dnsmasq-stop:
 	sudo killall dnsmasq
+	cp /etc/resolv.conf.bak /etc/resolv.conf
 
 .PHONY: iptables
 iptables:
-	sudo iptables -t nat -A PREROUTING -p udp --dport 53 -j DNAT --to-destination 127.0.0.1:53
+	iptables -A FORWARD -p udp --sport 53 -j DROP
